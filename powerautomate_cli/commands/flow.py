@@ -1,6 +1,9 @@
 """Power Automate flow commands using Management API."""
 import json
 import typer
+import tempfile
+import subprocess
+import os
 from typing import Optional
 from pathlib import Path
 
@@ -11,6 +14,7 @@ from ..output import (
     print_success,
     print_error,
     print_info,
+    print_warning,
     handle_api_error,
     format_response,
     ClientError,
@@ -23,6 +27,7 @@ app = typer.Typer(help="Manage Power Automate flows via Management API")
 def list_flows(
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     top: int = typer.Option(50, "--top", help="Number of flows to return"),
+    show_solution: bool = typer.Option(False, "--show-solution", help="Show solution information in table"),
 ):
     """
     List all Power Automate flows in the environment.
@@ -34,6 +39,7 @@ def list_flows(
         powerautomate flow list
         powerautomate flow list --table
         powerautomate flow list --top 10
+        powerautomate flow list --table --show-solution
     """
     try:
         client = get_client()
@@ -53,13 +59,21 @@ def list_flows(
         if table_format:
             display_flows = []
             for flow in flows:
-                display_flows.append({
+                flow_data = {
                     "name": flow.get("properties", {}).get("displayName", ""),
                     "id": flow.get("name", ""),
                     "state": flow.get("properties", {}).get("state", ""),
                     "created": flow.get("properties", {}).get("createdTime", ""),
-                })
-            print_table(display_flows, ["name", "id", "state", "created"])
+                }
+                if show_solution:
+                    flow_data["solution_id"] = flow.get("properties", {}).get("solutionId", "")
+                display_flows.append(flow_data)
+
+            columns = ["name", "id", "state", "created"]
+            if show_solution:
+                columns.append("solution_id")
+
+            print_table(display_flows, columns)
         else:
             print_json(flows)
 
@@ -92,7 +106,8 @@ def get_flow(
 def create_flow(
     name: str = typer.Option(..., "--name", "-n", help="Flow display name"),
     trigger: str = typer.Option("http", "--trigger", help="Trigger type: http, manual"),
-    solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Solution unique name"),
+    solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Solution unique name or ID"),
+    solution_id: Optional[str] = typer.Option(None, "--solution-id", help="Solution ID (GUID) - alternative to --solution"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="Flow description"),
 ):
     """
@@ -104,9 +119,19 @@ def create_flow(
     Examples:
         powerautomate flow create --name "My Flow" --trigger http
         powerautomate flow create --name "My Flow" --trigger http --solution ProgressContentAutomation
+        powerautomate flow create --name "My Flow" --trigger http --solution-id <guid>
     """
     try:
         client = get_client()
+
+        # Resolve solution if specified
+        resolved_solution_id = None
+        if solution_id:
+            resolved_solution_id = solution_id
+        elif solution:
+            print_info(f"Resolving solution: {solution}")
+            resolved_solution_id = client.resolve_solution_id(solution)
+            print_info(f"Solution ID: {resolved_solution_id}")
 
         # Build flow definition based on trigger type
         if trigger.lower() == "http":
@@ -171,9 +196,9 @@ def create_flow(
         if description:
             flow_data["properties"]["description"] = description
 
-        # If solution specified, need to add solution context
-        if solution:
-            flow_data["properties"]["solutionId"] = solution
+        # If solution specified, add solution context
+        if resolved_solution_id:
+            flow_data["properties"]["solutionId"] = resolved_solution_id
 
         # Create the flow via Management API
         result = client.post("flows", flow_data)
@@ -182,7 +207,12 @@ def create_flow(
         flow_name = result.get("properties", {}).get("displayName")
 
         print_success(f"Flow created successfully: {flow_id}")
-        print_json({"flow_id": flow_id, "name": flow_name, "trigger": trigger})
+
+        result_info = {"flow_id": flow_id, "name": flow_name, "trigger": trigger}
+        if resolved_solution_id:
+            result_info["solution_id"] = resolved_solution_id
+
+        print_json(result_info)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -195,38 +225,244 @@ def update_flow(
     name: Optional[str] = typer.Option(None, "--name", "-n", help="New display name"),
     description: Optional[str] = typer.Option(None, "--description", "-d", help="New description"),
     state: Optional[str] = typer.Option(None, "--state", help="State: started, stopped"),
+    solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Move flow to solution (unique name or ID)"),
+    solution_id: Optional[str] = typer.Option(None, "--solution-id", help="Move flow to solution (GUID)"),
+    definition_file: Optional[Path] = typer.Option(None, "--definition-file", "-f", help="JSON file with flow definition"),
+    edit: bool = typer.Option(False, "--edit", "-e", help="Open flow in editor for interactive editing"),
+    no_confirm: bool = typer.Option(False, "--no-confirm", help="Skip confirmation prompts"),
+    backup: bool = typer.Option(True, "--backup/--no-backup", help="Create backup before updating"),
 ):
     """
     Update an existing Power Automate flow.
 
+    This command supports multiple update modes:
+
+    1. Property updates (PATCH): Update name, state, or solution
+    2. Definition file (PATCH): Update complete flow from JSON file
+    3. Interactive edit (PATCH): Edit flow definition in $EDITOR
+
     Examples:
+        # Update properties only
         powerautomate flow update <flow-id> --name "New Name"
         powerautomate flow update <flow-id> --state started
+        powerautomate flow update <flow-id> --solution ProgressContentAutomation
+
+        # Update from definition file
+        powerautomate flow update <flow-id> --definition-file flow.json
+
+        # Interactive editing
+        powerautomate flow update <flow-id> --edit
+
+        # Skip confirmation prompts
+        powerautomate flow update <flow-id> --definition-file flow.json --no-confirm
+
+        # Don't create backup
+        powerautomate flow update <flow-id> --edit --no-backup
     """
     try:
         client = get_client()
 
-        # Build update payload
-        update_data = {"properties": {}}
+        # Determine update mode
+        is_definition_update = definition_file is not None or edit
+        is_property_update = name or description or state or solution or solution_id
 
-        if name:
-            update_data["properties"]["displayName"] = name
-        if description:
-            update_data["properties"]["description"] = description
-        if state:
-            state_value = "Started" if state.lower() == "started" else "Stopped"
-            update_data["properties"]["state"] = state_value
-
-        if not update_data["properties"]:
-            print_error("No update parameters provided")
+        if is_definition_update and is_property_update:
+            print_error("Cannot combine property updates with definition updates")
+            print_info("Use either --name/--description/--state/--solution OR --definition-file/--edit")
             raise typer.Exit(1)
 
-        client.patch(f"flows/{flow_id}", update_data)
-        print_success(f"Flow updated successfully: {flow_id}")
+        if not is_definition_update and not is_property_update:
+            print_error("No update parameters provided")
+            print_info("Use --name, --description, --state, --solution, --definition-file, or --edit")
+            raise typer.Exit(1)
+
+        # Property updates use PATCH (simpler, only specified fields)
+        if is_property_update:
+            _update_flow_properties(client, flow_id, name, description, state, solution, solution_id)
+            return
+
+        # Definition updates use PUT (complete flow object)
+        if definition_file:
+            _update_flow_from_file(client, flow_id, definition_file, backup, no_confirm)
+        elif edit:
+            _update_flow_interactive(client, flow_id, backup, no_confirm)
 
     except Exception as e:
         exit_code = handle_api_error(e)
         raise typer.Exit(exit_code)
+
+
+def _update_flow_properties(
+    client,
+    flow_id: str,
+    name: Optional[str],
+    description: Optional[str],
+    state: Optional[str],
+    solution: Optional[str],
+    solution_id: Optional[str],
+):
+    """Update flow properties using PATCH with full flow object."""
+    # Power Automate API requires full flow object for PATCH
+    # Get current flow first
+    current_flow = client.get(f"flows/{flow_id}")
+
+    # Resolve solution if specified
+    resolved_solution_id = None
+    if solution_id:
+        resolved_solution_id = solution_id
+    elif solution:
+        print_info(f"Resolving solution: {solution}")
+        resolved_solution_id = client.resolve_solution_id(solution)
+        print_info(f"Solution ID: {resolved_solution_id}")
+
+    # Update specific properties
+    if name:
+        current_flow["properties"]["displayName"] = name
+    if description:
+        current_flow["properties"]["description"] = description
+    if state:
+        state_value = "Started" if state.lower() == "started" else "Stopped"
+        current_flow["properties"]["state"] = state_value
+    if resolved_solution_id:
+        current_flow["properties"]["solutionId"] = resolved_solution_id
+
+    # Send PATCH with full flow object
+    client.patch(f"flows/{flow_id}", current_flow)
+    print_success(f"Flow properties updated successfully: {flow_id}")
+
+    if resolved_solution_id:
+        print_info(f"Flow moved to solution: {resolved_solution_id}")
+
+
+def _update_flow_from_file(client, flow_id: str, definition_file: Path, backup: bool, no_confirm: bool):
+    """Update flow from JSON definition file using PATCH."""
+    # Validate file exists
+    if not definition_file.exists():
+        raise ClientError(f"Definition file not found: {definition_file}")
+
+    # Read and validate JSON
+    try:
+        with open(definition_file, 'r') as f:
+            new_definition = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ClientError(f"Invalid JSON in definition file: {e}")
+
+    # Validate it's a flow object
+    if "properties" not in new_definition:
+        raise ClientError("Definition file must contain a 'properties' object")
+
+    # Get current flow for backup and comparison
+    current_flow = client.get(f"flows/{flow_id}")
+
+    # Create backup if requested
+    if backup:
+        backup_file = Path(f"{flow_id}_backup_{int(os.times().elapsed * 1000)}.json")
+        with open(backup_file, 'w') as f:
+            json.dump(current_flow, f, indent=2)
+        print_info(f"Backup created: {backup_file}")
+
+    # Show what's changing (if not skipping confirmation)
+    if not no_confirm:
+        print_info("Current flow properties:")
+        current_props = current_flow.get("properties", {})
+        print_info(f"  Name: {current_props.get('displayName', 'N/A')}")
+        print_info(f"  State: {current_props.get('state', 'N/A')}")
+
+        print_info("\nNew flow properties:")
+        new_props = new_definition.get("properties", {})
+        print_info(f"  Name: {new_props.get('displayName', 'N/A')}")
+        print_info(f"  State: {new_props.get('state', 'N/A')}")
+
+        confirmed = typer.confirm("\nProceed with update?")
+        if not confirmed:
+            print_warning("Update cancelled")
+            raise typer.Exit(0)
+
+    # Update using PATCH with full flow object
+    result = client.patch(f"flows/{flow_id}", new_definition)
+    print_success(f"Flow definition updated successfully: {flow_id}")
+
+    # Show updated properties
+    updated_props = result.get("properties", {})
+    print_info(f"Updated name: {updated_props.get('displayName', 'N/A')}")
+    print_info(f"Updated state: {updated_props.get('state', 'N/A')}")
+
+
+def _update_flow_interactive(client, flow_id: str, backup: bool, no_confirm: bool):
+    """Open flow definition in editor for interactive editing using PATCH."""
+    # Get current flow
+    current_flow = client.get(f"flows/{flow_id}")
+
+    # Create backup if requested
+    if backup:
+        backup_file = Path(f"{flow_id}_backup_{int(os.times().elapsed * 1000)}.json")
+        with open(backup_file, 'w') as f:
+            json.dump(current_flow, f, indent=2)
+        print_info(f"Backup created: {backup_file}")
+
+    # Create temporary file with current definition
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+        json.dump(current_flow, temp_file, indent=2)
+        temp_path = temp_file.name
+
+    try:
+        # Get editor from environment or use default
+        editor = os.environ.get('EDITOR', 'nano')
+
+        # Open editor
+        print_info(f"Opening flow in {editor}...")
+        print_info("Save and close the editor to apply changes, or exit without saving to cancel")
+        subprocess.run([editor, temp_path], check=True)
+
+        # Read edited content
+        with open(temp_path, 'r') as f:
+            edited_definition = json.load(f)
+
+        # Validate it's still a valid flow object
+        if "properties" not in edited_definition:
+            raise ClientError("Edited definition must contain a 'properties' object")
+
+        # Check if anything changed
+        if edited_definition == current_flow:
+            print_info("No changes detected")
+            raise typer.Exit(0)
+
+        # Show what's changing (if not skipping confirmation)
+        if not no_confirm:
+            print_info("Changes detected:")
+            current_props = current_flow.get("properties", {})
+            edited_props = edited_definition.get("properties", {})
+
+            if current_props.get("displayName") != edited_props.get("displayName"):
+                print_info(f"  Name: {current_props.get('displayName')} → {edited_props.get('displayName')}")
+            if current_props.get("state") != edited_props.get("state"):
+                print_info(f"  State: {current_props.get('state')} → {edited_props.get('state')}")
+            if current_props.get("definition") != edited_props.get("definition"):
+                print_info("  Definition: Changed")
+
+            confirmed = typer.confirm("\nProceed with update?")
+            if not confirmed:
+                print_warning("Update cancelled")
+                raise typer.Exit(0)
+
+        # Update using PATCH with full flow object
+        result = client.patch(f"flows/{flow_id}", edited_definition)
+        print_success(f"Flow definition updated successfully: {flow_id}")
+
+        # Show updated properties
+        updated_props = result.get("properties", {})
+        print_info(f"Updated name: {updated_props.get('displayName', 'N/A')}")
+        print_info(f"Updated state: {updated_props.get('state', 'N/A')}")
+
+    except json.JSONDecodeError as e:
+        raise ClientError(f"Invalid JSON after editing: {e}")
+    except subprocess.CalledProcessError:
+        print_warning("Editor exited with error, update cancelled")
+        raise typer.Exit(1)
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 @app.command("delete")

@@ -16,8 +16,12 @@ app = typer.Typer(
 
 # Import and register command modules
 try:
-    from .commands import flow
+    from .commands import flow, connector, solution, connection, user
     app.add_typer(flow.app, name="flow", help="Manage Power Automate flows via Management API")
+    app.add_typer(connector.app, name="connector", help="Manage Power Automate connectors (custom and managed)")
+    app.add_typer(solution.app, name="solution", help="Manage Power Platform solutions")
+    app.add_typer(connection.app, name="connection", help="Manage Power Automate connections")
+    app.add_typer(user.app, name="user", help="Manage Power Platform users and application users")
 except ImportError:
     # Commands not yet implemented - will add as we build them
     pass

@@ -36,6 +36,7 @@ class Config:
         self.client_id = os.getenv("DATAVERSE_CLIENT_ID", "")
         self.tenant_id = os.getenv("DATAVERSE_TENANT_ID", "")
         self.environment_id = os.getenv("DATAVERSE_ENVIRONMENT_ID") or os.getenv("POWERAUTOMATE_ENVIRONMENT_ID", "")
+        self.dataverse_url = os.getenv("DATAVERSE_URL", "")
 
     def get_missing_credentials(self) -> List[str]:
         """
