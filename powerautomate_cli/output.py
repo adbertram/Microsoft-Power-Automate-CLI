@@ -1,26 +1,70 @@
 """Output formatting utilities for Power Automate CLI."""
 import json
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional
+from functools import wraps
 from rich.console import Console
 from rich.table import Table
 from rich.json import JSON
+import typer
 
 
 console = Console()
 
 
-def print_json(data: Any, indent: int = 2):
+# Shared file output option that can be added to any command
+file_option = typer.Option(
+    None,
+    "--file",
+    "-f",
+    help="Save JSON output to file instead of printing to console",
+    show_default=False,
+)
+
+
+def output_json(data: Any, ctx: Optional[typer.Context] = None, file: Optional[str] = None, indent: int = 2):
     """
-    Print data as formatted JSON.
+    Output data as formatted JSON to console or file.
+
+    Checks multiple sources for file output preference:
+    1. Direct file parameter (highest priority)
+    2. Context object (for global --file parameter)
 
     Args:
-        data: Data to print as JSON
+        data: Data to output as JSON
+        ctx: Optional Typer context
+        file: Optional file path to save JSON to (overrides context)
         indent: Number of spaces for indentation
     """
+    # Determine output file (direct parameter takes precedence)
+    output_file = file
+
+    # Fall back to context if no direct file parameter
+    if output_file is None and ctx and ctx.obj:
+        output_file = ctx.obj.get('output_file')
+
+    # Convert data to JSON string
     if isinstance(data, str):
-        console.print(data)
+        json_str = data
     else:
-        console.print(JSON(json.dumps(data, indent=indent, default=str)))
+        # Use ensure_ascii=True to properly escape control characters (U+0000-U+001F)
+        # This ensures valid JSON output even when API responses contain invalid characters
+        json_str = json.dumps(data, indent=indent, default=str, ensure_ascii=True)
+
+    # Output to file or console
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(json_str)
+        print_success(f"JSON saved to {output_file}")
+    else:
+        # Print JSON string directly without Rich formatting
+        # Rich's JSON() class re-parses JSON which causes issues with control characters
+        # json.dumps() with ensure_ascii=True properly escapes them, so we print directly
+        print(json_str)
+
+
+# Backwards compatibility alias
+print_json = output_json
 
 
 def print_table(data: list[Dict[str, Any]], columns: list[str]):
@@ -38,7 +82,7 @@ def print_table(data: list[Dict[str, Any]], columns: list[str]):
     table = Table(show_header=True, header_style="bold magenta")
 
     for col in columns:
-        table.add_column(col)
+        table.add_column(col, no_wrap=False, overflow="fold")
 
     for row in data:
         table.add_row(*[str(row.get(col, "")) for col in columns])

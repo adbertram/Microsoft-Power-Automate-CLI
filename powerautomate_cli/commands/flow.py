@@ -1,15 +1,13 @@
 """Power Automate flow commands using Management API."""
 import json
 import typer
-import tempfile
-import subprocess
 import os
 from typing import Optional
 from pathlib import Path
 
-from ..client import get_client
+from ..client import get_client, get_dataverse_client
 from ..output import (
-    print_json,
+    output_json,
     print_table,
     print_success,
     print_error,
@@ -25,6 +23,7 @@ app = typer.Typer(help="Manage Power Automate flows via Management API")
 
 @app.command("list")
 def list_flows(
+    ctx: typer.Context,
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     top: int = typer.Option(50, "--top", help="Number of flows to return"),
     show_solution: bool = typer.Option(False, "--show-solution", help="Show solution information in table"),
@@ -32,8 +31,8 @@ def list_flows(
     """
     List all Power Automate flows in the environment.
 
-    This uses the Power Automate Management API to list flows
-    that are properly registered with resourceid.
+    This uses the Power Automate Management API to list flows and retrieves
+    corresponding Dataverse workflow IDs for detailed querying.
 
     Examples:
         powerautomate flow list
@@ -55,13 +54,63 @@ def list_flows(
             print_error("No flows found")
             return
 
+        # Always get Dataverse workflow mappings
+        # All Power Automate flows have corresponding Dataverse workflows
+        workflow_map = {}
+        try:
+            dv_client = get_dataverse_client()
+
+            # Get all workflow IDs from Dataverse
+            # Query by workflowid to find matches
+            flow_ids = [f.get("name", "") for f in flows]
+
+            # Try direct lookup first (flow ID might match workflow ID)
+            for flow_id in flow_ids:
+                try:
+                    wf = dv_client.get(f"workflows({flow_id})", {
+                        "$select": "workflowid"
+                    })
+                    workflow_map[flow_id] = wf.get("workflowid")
+                except:
+                    # Flow ID doesn't match workflow ID directly
+                    pass
+
+            # For any unmapped flows, search by name in workflows table
+            unmapped = [fid for fid in flow_ids if fid not in workflow_map]
+            if unmapped:
+                for flow in flows:
+                    flow_id = flow.get("name", "")
+                    if flow_id in workflow_map:
+                        continue
+
+                    display_name = flow.get("properties", {}).get("displayName", "")
+                    if display_name:
+                        try:
+                            # Search by display name
+                            wf_result = dv_client.get("workflows", {
+                                "$select": "workflowid,name",
+                                "$filter": f"name eq '{display_name}'",
+                                "$top": 1
+                            })
+                            wf_list = wf_result.get("value", [])
+                            if wf_list:
+                                workflow_map[flow_id] = wf_list[0].get("workflowid")
+                        except:
+                            pass
+        except Exception as e:
+            print_info(f"Note: Could not retrieve Dataverse workflow mappings: {e}")
+
         # Format for display
         if table_format:
             display_flows = []
             for flow in flows:
+                flow_id = flow.get("name", "")
+                dv_workflow_id = workflow_map.get(flow_id, flow_id)
+
                 flow_data = {
                     "name": flow.get("properties", {}).get("displayName", ""),
-                    "id": flow.get("name", ""),
+                    "id": flow_id,
+                    "dataverse_workflow_id": dv_workflow_id,
                     "state": flow.get("properties", {}).get("state", ""),
                     "created": flow.get("properties", {}).get("createdTime", ""),
                 }
@@ -69,13 +118,17 @@ def list_flows(
                     flow_data["solution_id"] = flow.get("properties", {}).get("solutionId", "")
                 display_flows.append(flow_data)
 
-            columns = ["name", "id", "state", "created"]
+            columns = ["name", "id", "dataverse_workflow_id", "state", "created"]
             if show_solution:
                 columns.append("solution_id")
 
             print_table(display_flows, columns)
         else:
-            print_json(flows)
+            # Add dataverse_workflow_id to JSON output as well
+            for flow in flows:
+                flow_id = flow.get("name", "")
+                flow["dataverse_workflow_id"] = workflow_map.get(flow_id, flow_id)
+            output_json(flows, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -84,6 +137,7 @@ def list_flows(
 
 @app.command("get")
 def get_flow(
+    ctx: typer.Context,
     flow_id: str = typer.Argument(..., help="Flow ID (name, not GUID)"),
 ):
     """
@@ -91,11 +145,12 @@ def get_flow(
 
     Examples:
         powerautomate flow get <flow-id>
+        powerautomate flow get <flow-id> --file flow.json
     """
     try:
         client = get_client()
         result = client.get(f"flows/{flow_id}")
-        print_json(result)
+        output_json(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -104,6 +159,7 @@ def get_flow(
 
 @app.command("create")
 def create_flow(
+    ctx: typer.Context,
     name: str = typer.Option(..., "--name", "-n", help="Flow display name"),
     trigger: str = typer.Option("http", "--trigger", help="Trigger type: http, manual"),
     solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Solution unique name or ID"),
@@ -212,7 +268,7 @@ def create_flow(
         if resolved_solution_id:
             result_info["solution_id"] = resolved_solution_id
 
-        print_json(result_info)
+        output_json(result_info, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -228,18 +284,16 @@ def update_flow(
     solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Move flow to solution (unique name or ID)"),
     solution_id: Optional[str] = typer.Option(None, "--solution-id", help="Move flow to solution (GUID)"),
     definition_file: Optional[Path] = typer.Option(None, "--definition-file", "-f", help="JSON file with flow definition"),
-    edit: bool = typer.Option(False, "--edit", "-e", help="Open flow in editor for interactive editing"),
     no_confirm: bool = typer.Option(False, "--no-confirm", help="Skip confirmation prompts"),
     backup: bool = typer.Option(True, "--backup/--no-backup", help="Create backup before updating"),
 ):
     """
     Update an existing Power Automate flow.
 
-    This command supports multiple update modes:
+    This command supports two update modes:
 
     1. Property updates (PATCH): Update name, state, or solution
     2. Definition file (PATCH): Update complete flow from JSON file
-    3. Interactive edit (PATCH): Edit flow definition in $EDITOR
 
     Examples:
         # Update properties only
@@ -250,30 +304,27 @@ def update_flow(
         # Update from definition file
         powerautomate flow update <flow-id> --definition-file flow.json
 
-        # Interactive editing
-        powerautomate flow update <flow-id> --edit
-
         # Skip confirmation prompts
         powerautomate flow update <flow-id> --definition-file flow.json --no-confirm
 
         # Don't create backup
-        powerautomate flow update <flow-id> --edit --no-backup
+        powerautomate flow update <flow-id> --definition-file flow.json --no-backup
     """
     try:
         client = get_client()
 
         # Determine update mode
-        is_definition_update = definition_file is not None or edit
+        is_definition_update = definition_file is not None
         is_property_update = name or description or state or solution or solution_id
 
         if is_definition_update and is_property_update:
             print_error("Cannot combine property updates with definition updates")
-            print_info("Use either --name/--description/--state/--solution OR --definition-file/--edit")
+            print_info("Use either --name/--description/--state/--solution OR --definition-file")
             raise typer.Exit(1)
 
         if not is_definition_update and not is_property_update:
             print_error("No update parameters provided")
-            print_info("Use --name, --description, --state, --solution, --definition-file, or --edit")
+            print_info("Use --name, --description, --state, --solution, or --definition-file")
             raise typer.Exit(1)
 
         # Property updates use PATCH (simpler, only specified fields)
@@ -284,8 +335,6 @@ def update_flow(
         # Definition updates use PUT (complete flow object)
         if definition_file:
             _update_flow_from_file(client, flow_id, definition_file, backup, no_confirm)
-        elif edit:
-            _update_flow_interactive(client, flow_id, backup, no_confirm)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -388,83 +437,6 @@ def _update_flow_from_file(client, flow_id: str, definition_file: Path, backup: 
     print_info(f"Updated state: {updated_props.get('state', 'N/A')}")
 
 
-def _update_flow_interactive(client, flow_id: str, backup: bool, no_confirm: bool):
-    """Open flow definition in editor for interactive editing using PATCH."""
-    # Get current flow
-    current_flow = client.get(f"flows/{flow_id}")
-
-    # Create backup if requested
-    if backup:
-        backup_file = Path(f"{flow_id}_backup_{int(os.times().elapsed * 1000)}.json")
-        with open(backup_file, 'w') as f:
-            json.dump(current_flow, f, indent=2)
-        print_info(f"Backup created: {backup_file}")
-
-    # Create temporary file with current definition
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-        json.dump(current_flow, temp_file, indent=2)
-        temp_path = temp_file.name
-
-    try:
-        # Get editor from environment or use default
-        editor = os.environ.get('EDITOR', 'nano')
-
-        # Open editor
-        print_info(f"Opening flow in {editor}...")
-        print_info("Save and close the editor to apply changes, or exit without saving to cancel")
-        subprocess.run([editor, temp_path], check=True)
-
-        # Read edited content
-        with open(temp_path, 'r') as f:
-            edited_definition = json.load(f)
-
-        # Validate it's still a valid flow object
-        if "properties" not in edited_definition:
-            raise ClientError("Edited definition must contain a 'properties' object")
-
-        # Check if anything changed
-        if edited_definition == current_flow:
-            print_info("No changes detected")
-            raise typer.Exit(0)
-
-        # Show what's changing (if not skipping confirmation)
-        if not no_confirm:
-            print_info("Changes detected:")
-            current_props = current_flow.get("properties", {})
-            edited_props = edited_definition.get("properties", {})
-
-            if current_props.get("displayName") != edited_props.get("displayName"):
-                print_info(f"  Name: {current_props.get('displayName')} → {edited_props.get('displayName')}")
-            if current_props.get("state") != edited_props.get("state"):
-                print_info(f"  State: {current_props.get('state')} → {edited_props.get('state')}")
-            if current_props.get("definition") != edited_props.get("definition"):
-                print_info("  Definition: Changed")
-
-            confirmed = typer.confirm("\nProceed with update?")
-            if not confirmed:
-                print_warning("Update cancelled")
-                raise typer.Exit(0)
-
-        # Update using PATCH with full flow object
-        result = client.patch(f"flows/{flow_id}", edited_definition)
-        print_success(f"Flow definition updated successfully: {flow_id}")
-
-        # Show updated properties
-        updated_props = result.get("properties", {})
-        print_info(f"Updated name: {updated_props.get('displayName', 'N/A')}")
-        print_info(f"Updated state: {updated_props.get('state', 'N/A')}")
-
-    except json.JSONDecodeError as e:
-        raise ClientError(f"Invalid JSON after editing: {e}")
-    except subprocess.CalledProcessError:
-        print_warning("Editor exited with error, update cancelled")
-        raise typer.Exit(1)
-    finally:
-        # Clean up temp file
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
 @app.command("delete")
 def delete_flow(
     flow_id: str = typer.Argument(..., help="Flow ID (name)"),
@@ -537,6 +509,7 @@ def stop_flow(
 
 @app.command("runs")
 def list_runs(
+    ctx: typer.Context,
     flow_id: str = typer.Argument(..., help="Flow ID (name)"),
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     top: int = typer.Option(50, "--top", help="Number of runs to return (max 100)"),
@@ -559,12 +532,19 @@ def list_runs(
         powerautomate flow runs <flow-id> --filter "status eq 'Failed'"
     """
     try:
+        # Use Power Automate Management API for flow runs
         client = get_client()
 
-        # Build query parameters
-        params = {"api-version": "2016-11-01", "$top": min(top, 100)}
+        # Build Power Automate API endpoint (client.get() prepends environment path)
+        endpoint = f"flows/{flow_id}/runs"
 
-        # Handle status filters
+        # Build query parameters
+        params = {
+            "api-version": "2016-11-01",
+            "$top": min(top, 100)
+        }
+
+        # Add status filter if specified
         if failed:
             params["$filter"] = "status eq 'Failed'"
         elif succeeded:
@@ -574,8 +554,8 @@ def list_runs(
         elif status_filter:
             params["$filter"] = status_filter
 
-        # Query flow runs
-        result = client.get(f"flows/{flow_id}/runs", params=params)
+        # Query flow runs from Power Automate Management API
+        result = client.get(endpoint, params=params)
 
         # Extract runs from response
         runs = result.get("value", [])
@@ -588,20 +568,27 @@ def list_runs(
         if table_format:
             display_runs = []
             for run in runs:
+                # Power Automate API fields
                 props = run.get("properties", {})
-                display_runs.append({
-                    "name": run.get("name", ""),
-                    "status": props.get("status", ""),
-                    "start_time": props.get("startTime", ""),
-                    "end_time": props.get("endTime", ""),
-                    "trigger": props.get("trigger", {}).get("name", ""),
-                })
-            print_table(display_runs, ["name", "status", "start_time", "end_time", "trigger"])
-        else:
-            print_json(runs)
+                run_name = run.get("name", "")[:8] + "..."  # Truncate ID
+                status = props.get("status", "")
+                start_time = props.get("startTime", "")
+                end_time = props.get("endTime", "")
+                error = props.get("error", {}).get("code", "") or ""
 
-        # Show pagination info if there are more results
-        if "nextLink" in result:
+                display_runs.append({
+                    "run_id": run_name,
+                    "status": status,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "error": error
+                })
+            print_table(display_runs, ["run_id", "status", "start_time", "end_time", "error"])
+        else:
+            output_json(runs, ctx)
+
+        # Show pagination info
+        if len(runs) == top:
             print_info(f"More results available. Showing first {len(runs)} runs.")
 
     except Exception as e:
@@ -611,6 +598,7 @@ def list_runs(
 
 @app.command("run")
 def get_run(
+    ctx: typer.Context,
     flow_id: str = typer.Argument(..., help="Flow ID (name)"),
     run_id: str = typer.Argument(..., help="Run ID (name)"),
 ):
@@ -619,6 +607,7 @@ def get_run(
 
     Examples:
         powerautomate flow run <flow-id> <run-id>
+        powerautomate flow run <flow-id> <run-id> --file run.json
     """
     try:
         client = get_client()
@@ -627,7 +616,7 @@ def get_run(
         params = {"api-version": "2016-11-01"}
         result = client.get(f"flows/{flow_id}/runs/{run_id}", params=params)
 
-        print_json(result)
+        output_json(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
