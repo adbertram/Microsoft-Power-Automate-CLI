@@ -7,14 +7,12 @@ from pathlib import Path
 
 from ..client import get_client, get_dataverse_client
 from ..output import (
-    output_json,
-    print_table,
+    format_response,
     print_success,
     print_error,
     print_info,
     print_warning,
     handle_api_error,
-    format_response,
     ClientError,
 )
 
@@ -24,7 +22,6 @@ app = typer.Typer(help="Manage Power Automate flows via Management API")
 @app.command("list")
 def list_flows(
     ctx: typer.Context,
-    table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     top: int = typer.Option(50, "--top", help="Number of flows to return"),
     show_solution: bool = typer.Option(False, "--show-solution", help="Show solution information in table"),
 ):
@@ -36,9 +33,9 @@ def list_flows(
 
     Examples:
         powerautomate flow list
-        powerautomate flow list --table
+        powerautomate --table flow list
         powerautomate flow list --top 10
-        powerautomate flow list --table --show-solution
+        powerautomate --table flow list --show-solution
     """
     try:
         client = get_client()
@@ -100,35 +97,30 @@ def list_flows(
         except Exception as e:
             print_info(f"Note: Could not retrieve Dataverse workflow mappings: {e}")
 
-        # Format for display
-        if table_format:
-            display_flows = []
-            for flow in flows:
-                flow_id = flow.get("name", "")
-                dv_workflow_id = workflow_map.get(flow_id, flow_id)
+        # Build display data with dataverse_workflow_id
+        display_flows = []
+        for flow in flows:
+            flow_id = flow.get("name", "")
+            dv_workflow_id = workflow_map.get(flow_id, flow_id)
 
-                flow_data = {
-                    "name": flow.get("properties", {}).get("displayName", ""),
-                    "id": flow_id,
-                    "dataverse_workflow_id": dv_workflow_id,
-                    "state": flow.get("properties", {}).get("state", ""),
-                    "created": flow.get("properties", {}).get("createdTime", ""),
-                }
-                if show_solution:
-                    flow_data["solution_id"] = flow.get("properties", {}).get("solutionId", "")
-                display_flows.append(flow_data)
-
-            columns = ["name", "id", "dataverse_workflow_id", "state", "created"]
+            flow_data = {
+                "name": flow.get("properties", {}).get("displayName", ""),
+                "id": flow_id,
+                "dataverse_workflow_id": dv_workflow_id,
+                "state": flow.get("properties", {}).get("state", ""),
+                "created": flow.get("properties", {}).get("createdTime", ""),
+            }
             if show_solution:
-                columns.append("solution_id")
+                flow_data["solution_id"] = flow.get("properties", {}).get("solutionId", "")
+            display_flows.append(flow_data)
 
-            print_table(display_flows, columns)
-        else:
-            # Add dataverse_workflow_id to JSON output as well
-            for flow in flows:
-                flow_id = flow.get("name", "")
-                flow["dataverse_workflow_id"] = workflow_map.get(flow_id, flow_id)
-            output_json(flows, ctx)
+        # Define columns for table output
+        columns = ["name", "id", "dataverse_workflow_id", "state", "created"]
+        if show_solution:
+            columns.append("solution_id")
+
+        # Use centralized output handler
+        format_response(display_flows, ctx, columns=columns)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -150,7 +142,7 @@ def get_flow(
     try:
         client = get_client()
         result = client.get(f"flows/{flow_id}")
-        output_json(result, ctx)
+        format_response(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -268,7 +260,7 @@ def create_flow(
         if resolved_solution_id:
             result_info["solution_id"] = resolved_solution_id
 
-        output_json(result_info, ctx)
+        format_response(result_info, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -284,7 +276,7 @@ def update_flow(
     solution: Optional[str] = typer.Option(None, "--solution", "-s", help="Move flow to solution (unique name or ID)"),
     solution_id: Optional[str] = typer.Option(None, "--solution-id", help="Move flow to solution (GUID)"),
     definition_file: Optional[Path] = typer.Option(None, "--definition-file", "-f", help="JSON file with flow definition"),
-    no_confirm: bool = typer.Option(False, "--no-confirm", help="Skip confirmation prompts"),
+    no_confirm: bool = typer.Option(False, "--no-confirm", "--yes", "-y", help="Skip confirmation prompts"),
     backup: bool = typer.Option(True, "--backup/--no-backup", help="Create backup before updating"),
 ):
     """
@@ -511,7 +503,6 @@ def stop_flow(
 def list_runs(
     ctx: typer.Context,
     flow_id: str = typer.Argument(..., help="Flow ID (name)"),
-    table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     top: int = typer.Option(50, "--top", help="Number of runs to return (max 100)"),
     status_filter: Optional[str] = typer.Option(None, "--filter", help="Filter by status (e.g., 'Succeeded', 'Failed', 'Running')"),
     failed: bool = typer.Option(False, "--failed", help="Show only failed runs"),
@@ -526,8 +517,8 @@ def list_runs(
 
     Examples:
         powerautomate flow runs <flow-id>
-        powerautomate flow runs <flow-id> --table
-        powerautomate flow runs <flow-id> --failed --table
+        powerautomate --table flow runs <flow-id>
+        powerautomate --table flow runs <flow-id> --failed
         powerautomate flow runs <flow-id> --succeeded --top 10
         powerautomate flow runs <flow-id> --filter "status eq 'Failed'"
     """
@@ -564,28 +555,27 @@ def list_runs(
             print_error("No runs found")
             return
 
-        # Format for display
-        if table_format:
-            display_runs = []
-            for run in runs:
-                # Power Automate API fields
-                props = run.get("properties", {})
-                run_name = run.get("name", "")[:8] + "..."  # Truncate ID
-                status = props.get("status", "")
-                start_time = props.get("startTime", "")
-                end_time = props.get("endTime", "")
-                error = props.get("error", {}).get("code", "") or ""
+        # Build display data
+        display_runs = []
+        for run in runs:
+            # Power Automate API fields
+            props = run.get("properties", {})
+            run_name = run.get("name", "")[:8] + "..."  # Truncate ID
+            status = props.get("status", "")
+            start_time = props.get("startTime", "")
+            end_time = props.get("endTime", "")
+            error = props.get("error", {}).get("code", "") or ""
 
-                display_runs.append({
-                    "run_id": run_name,
-                    "status": status,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "error": error
-                })
-            print_table(display_runs, ["run_id", "status", "start_time", "end_time", "error"])
-        else:
-            output_json(runs, ctx)
+            display_runs.append({
+                "run_id": run_name,
+                "status": status,
+                "start_time": start_time,
+                "end_time": end_time,
+                "error": error
+            })
+
+        # Use centralized output handler
+        format_response(display_runs, ctx, columns=["run_id", "status", "start_time", "end_time", "error"])
 
         # Show pagination info
         if len(runs) == top:
@@ -616,7 +606,7 @@ def get_run(
         params = {"api-version": "2016-11-01"}
         result = client.get(f"flows/{flow_id}/runs/{run_id}", params=params)
 
-        output_json(result, ctx)
+        format_response(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)

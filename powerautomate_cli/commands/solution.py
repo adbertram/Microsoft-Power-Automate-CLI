@@ -11,8 +11,7 @@ from typing import Optional
 
 from ..client import get_client
 from ..output import (
-    print_json,
-    print_table,
+    format_response,
     print_success,
     print_error,
     print_info,
@@ -25,6 +24,7 @@ app = typer.Typer(help="Manage Power Platform solutions")
 
 @app.command("list")
 def list_solutions(
+    ctx: typer.Context,
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
     filter_text: Optional[str] = typer.Option(None, "--filter", "-f", help="Filter solutions by name"),
 ):
@@ -59,9 +59,9 @@ def list_solutions(
                     "version": props.get("version", ""),
                     "publisher": props.get("publisherName", ""),
                 })
-            print_table(display_solutions, ["displayName", "uniqueName", "id", "version", "publisher"])
+            format_response(display_solutions, ctx, columns=["displayName", "uniqueName", "id", "version", "publisher"])
         else:
-            print_json(solutions)
+            format_response(solutions, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -70,6 +70,7 @@ def list_solutions(
 
 @app.command("get")
 def get_solution(
+    ctx: typer.Context,
     solution_id: str = typer.Argument(..., help="Solution ID or unique name"),
     by_name: bool = typer.Option(False, "--name", help="Treat argument as solution unique name"),
 ):
@@ -88,7 +89,7 @@ def get_solution(
             solution_id = client.resolve_solution_id(solution_id)
 
         result = client.get_solution(solution_id)
-        print_json(result)
+        format_response(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -97,6 +98,7 @@ def get_solution(
 
 @app.command("components")
 def list_components(
+    ctx: typer.Context,
     solution_id: str = typer.Argument(..., help="Solution ID or unique name"),
     by_name: bool = typer.Option(False, "--name", help="Treat argument as solution unique name"),
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
@@ -137,9 +139,9 @@ def list_components(
                     "id": component.get("name", ""),
                     "createdTime": props.get("createdTime", ""),
                 })
-            print_table(display_components, ["displayName", "type", "id", "createdTime"])
+            format_response(display_components, ctx, columns=["displayName", "type", "id", "createdTime"])
         else:
-            print_json(components)
+            format_response(components, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -148,6 +150,7 @@ def list_components(
 
 @app.command("flows")
 def list_solution_flows(
+    ctx: typer.Context,
     solution_id: str = typer.Argument(..., help="Solution ID or unique name"),
     by_name: bool = typer.Option(False, "--name", help="Treat argument as solution unique name"),
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
@@ -187,9 +190,9 @@ def list_solution_flows(
                     "state": props.get("state", ""),
                     "createdTime": props.get("createdTime", ""),
                 })
-            print_table(display_flows, ["displayName", "id", "state", "createdTime"])
+            format_response(display_flows, ctx, columns=["displayName", "id", "state", "createdTime"])
         else:
-            print_json(flows)
+            format_response(flows, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)

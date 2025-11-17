@@ -32,11 +32,16 @@ class Config:
         # Also check local .env
         load_dotenv()
 
-        # Only the essentials for delegated authentication
+        # Power Automate API (delegated authentication)
         self.client_id = os.getenv("DATAVERSE_CLIENT_ID", "")
         self.tenant_id = os.getenv("DATAVERSE_TENANT_ID", "")
         self.environment_id = os.getenv("DATAVERSE_ENVIRONMENT_ID") or os.getenv("POWERAUTOMATE_ENVIRONMENT_ID", "")
         self.dataverse_url = os.getenv("DATAVERSE_URL", "")
+
+        # Dataverse API (service principal or user authentication)
+        self.client_secret = os.getenv("DATAVERSE_CLIENT_SECRET", "")
+        self.username = os.getenv("DATAVERSE_USERNAME", "")
+        self.password = os.getenv("DATAVERSE_PASSWORD", "")
 
     def get_missing_credentials(self) -> List[str]:
         """

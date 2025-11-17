@@ -3,8 +3,7 @@ import typer
 from typing import Optional
 from ..client import get_client
 from ..output import (
-    print_json,
-    print_table,
+    format_response,
     print_success,
     print_error,
     print_info,
@@ -17,6 +16,7 @@ app = typer.Typer(help="Manage Power Platform users and application users")
 
 @app.command("create-app-user")
 def create_app_user(
+    ctx: typer.Context,
     app_id: str = typer.Argument(..., help="Azure AD Application ID (Client ID)"),
     roles: Optional[str] = typer.Option(
         "System Administrator",
@@ -73,7 +73,7 @@ def create_app_user(
             if existing:
                 user_id = existing[0].get("systemuserid")
                 print_warning(f"Application user already exists with ID: {user_id}")
-                print_json(existing[0])
+                format_response(existing[0], ctx)
 
                 # Assign roles to existing user
                 if roles:
@@ -223,6 +223,7 @@ def assign_roles_to_user(api_url: str, access_token: str, user_id: str, role_nam
 
 @app.command("list-app-users")
 def list_app_users(
+    ctx: typer.Context,
     table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
 ):
     """
@@ -281,9 +282,9 @@ def list_app_users(
                     "user_id": user.get("systemuserid", ""),
                     "disabled": "Yes" if user.get("isdisabled") else "No",
                 })
-            print_table(display_users, ["name", "app_id", "user_id", "disabled"])
+            format_response(display_users, ctx, columns=["name", "app_id", "user_id", "disabled"])
         else:
-            print_json(users)
+            format_response(users, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -292,6 +293,7 @@ def list_app_users(
 
 @app.command("assign-role")
 def assign_role_to_user(
+    ctx: typer.Context,
     email: str = typer.Argument(..., help="User email address"),
     role: str = typer.Argument(..., help="Security role name (e.g., 'System Administrator')"),
 ):

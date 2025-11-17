@@ -16,12 +16,13 @@ app = typer.Typer(
 
 # Import and register command modules
 try:
-    from .commands import flow, connector, solution, connection, user
+    from .commands import flow, connector, solution, connection, user, openapi
     app.add_typer(flow.app, name="flow", help="Manage Power Automate flows via Management API")
     app.add_typer(connector.app, name="connector", help="Manage Power Automate connectors (custom and managed)")
     app.add_typer(solution.app, name="solution", help="Manage Power Platform solutions")
     app.add_typer(connection.app, name="connection", help="Manage Power Automate connections")
     app.add_typer(user.app, name="user", help="Manage Power Platform users and application users")
+    app.add_typer(openapi.app, name="openapi", help="OpenAPI specification validation and manipulation")
 except ImportError:
     # Commands not yet implemented - will add as we build them
     pass
@@ -36,6 +37,23 @@ def callback(
         "-v",
         help="Show version and exit",
         is_eager=True,
+    ),
+    file: Optional[str] = typer.Option(
+        None,
+        "--file",
+        "-f",
+        help="Save JSON output to file instead of printing to console",
+    ),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Output raw API response without removing metadata fields",
+    ),
+    table: bool = typer.Option(
+        False,
+        "--table",
+        "-t",
+        help="Output data as a formatted table instead of JSON",
     ),
 ):
     """
@@ -59,12 +77,20 @@ def callback(
         powerautomate flow list
         powerautomate flow create --name "My Flow" --trigger http
         powerautomate flow start <flow-id>
-        powerautomate flow get <flow-id>
+        powerautomate --file flow.json flow get <flow-id>
+        powerautomate --raw flow get <flow-id>
+        powerautomate --table flow list
     """
     if version:
         from . import __version__
         typer.echo(f"powerautomate-cli version {__version__}")
         raise typer.Exit()
+
+    # Store parameters in context for access by all commands
+    ctx.ensure_object(dict)
+    ctx.obj['output_file'] = file
+    ctx.obj['output_raw'] = raw
+    ctx.obj['output_table'] = table
 
 
 def main():

@@ -136,25 +136,117 @@ def handle_api_error(error: Exception) -> int:
         return 1
 
 
-def format_response(data: Any) -> Any:
+def _clean_metadata(data: Any) -> Any:
     """
-    Format API response for display.
-
-    Removes metadata and cleans up response.
+    Recursively remove @odata metadata fields from response data.
 
     Args:
-        data: Raw API response
+        data: Data to clean (dict, list, or primitive)
 
     Returns:
-        Cleaned response data
+        Cleaned data with @odata fields removed
     """
     if isinstance(data, dict):
-        # Remove metadata
-        cleaned = {k: v for k, v in data.items() if not k.startswith("@")}
-
-        # If there's a 'value' key (list response), return that
-        if "value" in cleaned and isinstance(cleaned["value"], list):
-            return cleaned["value"]
-
+        # Remove @odata fields and recursively clean nested objects
+        cleaned = {}
+        for k, v in data.items():
+            if not k.startswith("@odata"):
+                cleaned[k] = _clean_metadata(v)
         return cleaned
-    return data
+    elif isinstance(data, list):
+        # Recursively clean list items
+        return [_clean_metadata(item) for item in data]
+    else:
+        # Return primitives unchanged
+        return data
+
+
+def _infer_columns(data: list[Dict[str, Any]]) -> list[str]:
+    """
+    Infer column names from a list of dictionaries.
+
+    Args:
+        data: List of dictionaries
+
+    Returns:
+        List of column names (keys from first item)
+    """
+    if not data or not isinstance(data, list) or not isinstance(data[0], dict):
+        return []
+    return list(data[0].keys())
+
+
+def format_response(data: Any, ctx: typer.Context, columns: Optional[list[str]] = None):
+    """
+    Universal output function for all Power Automate CLI commands.
+
+    Handles:
+    - Raw vs cleaned output (--raw flag)
+    - JSON vs table format (--table flag)
+    - File vs console output (--file flag)
+    - Recursive metadata removal
+
+    Args:
+        data: Raw API response data
+        ctx: Typer context containing global flags
+        columns: Optional column list for table output (auto-inferred if not provided)
+    """
+    # Get flags from context
+    output_raw = ctx.obj.get('output_raw', False) if ctx and ctx.obj else False
+    output_table = ctx.obj.get('output_table', False) if ctx and ctx.obj else False
+    output_file = ctx.obj.get('output_file') if ctx and ctx.obj else None
+
+    # Step 1: Clean metadata (unless --raw flag is set)
+    if not output_raw:
+        data = _clean_metadata(data)
+
+    # Step 2: Determine output format and generate output
+    if output_table:
+        # Table output
+        # Ensure data is a list for table display
+        if isinstance(data, dict) and "value" in data:
+            table_data = data["value"]
+        elif isinstance(data, list):
+            table_data = data
+        else:
+            # Single item - wrap in list
+            table_data = [data] if isinstance(data, dict) else []
+
+        # Infer columns if not provided
+        if not columns:
+            columns = _infer_columns(table_data)
+
+        if not table_data:
+            output_text = "No data found"
+        else:
+            # Generate table
+            table = Table(show_header=True, header_style="bold magenta")
+            for col in columns:
+                table.add_column(col, no_wrap=False, overflow="fold")
+
+            for row in table_data:
+                table.add_row(*[str(row.get(col, "")) for col in columns])
+
+            # Output table
+            if output_file:
+                # For file output, convert table to text representation
+                # Rich doesn't have great file export, so convert to JSON instead
+                output_text = json.dumps(table_data, indent=2, default=str, ensure_ascii=True)
+            else:
+                # Print table to console
+                console.print(table)
+                return
+    else:
+        # JSON output
+        if isinstance(data, str):
+            output_text = data
+        else:
+            output_text = json.dumps(data, indent=2, default=str, ensure_ascii=True)
+
+    # Step 3: Output to file or console
+    if output_file:
+        with open(output_file, 'w') as f:
+            f.write(output_text)
+        print_success(f"Output saved to {output_file}")
+    else:
+        print(output_text)

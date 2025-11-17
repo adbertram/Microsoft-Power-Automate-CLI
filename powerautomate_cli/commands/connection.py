@@ -3,7 +3,7 @@ import typer
 import json
 from typing import Optional
 from ..client import get_client
-from ..output import print_table, print_json, print_success, print_info, print_error, ClientError
+from ..output import format_response, print_success, print_info, print_error, ClientError
 
 
 app = typer.Typer(help="Manage Power Automate connections")
@@ -11,9 +11,8 @@ app = typer.Typer(help="Manage Power Automate connections")
 
 @app.command("list")
 def list_connections(
+    ctx: typer.Context,
     connector_id: Optional[str] = typer.Option(None, "--connector", "-c", help="Filter by connector ID"),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
-    table: bool = typer.Option(False, "--table", help="Output as formatted table"),
 ):
     """
     List all connections in the environment.
@@ -22,37 +21,33 @@ def list_connections(
     stores OAuth credentials and refresh tokens for API access.
 
     Examples:
-        powerautomate connection list --table
+        powerautomate connection list
+        powerautomate --table connection list
         powerautomate connection list --connector shared_prg-5fpodio-5fd251d00ef0afcb57
-        powerautomate connection list --json
     """
     try:
         client = get_client()
         result = client.list_connections(connector_id=connector_id)
 
-        if json_output:
-            print_json(result)
-        elif table:
-            connections = result.get("value", [])
-            if not connections:
-                print_info("No connections found")
-                return
+        connections = result.get("value", [])
+        if not connections:
+            print_info("No connections found")
+            return
 
-            # Format for table display
-            table_data = []
-            for conn in connections:
-                props = conn.get("properties", {})
-                table_data.append({
-                    "name": props.get("displayName", ""),
-                    "id": conn.get("name", ""),
-                    "connector": props.get("apiId", "").split("/")[-1] if props.get("apiId") else "",
-                    "status": props.get("statuses", [{}])[0].get("status", "Unknown") if props.get("statuses") else "Unknown",
-                    "created": props.get("createdTime", "")[:10] if props.get("createdTime") else "",
-                })
+        # Build display data
+        table_data = []
+        for conn in connections:
+            props = conn.get("properties", {})
+            table_data.append({
+                "name": props.get("displayName", ""),
+                "id": conn.get("name", ""),
+                "connector": props.get("apiId", "").split("/")[-1] if props.get("apiId") else "",
+                "status": props.get("statuses", [{}])[0].get("status", "Unknown") if props.get("statuses") else "Unknown",
+                "created": props.get("createdTime", "")[:10] if props.get("createdTime") else "",
+            })
 
-            print_table(table_data, ["name", "id", "connector", "status", "created"])
-        else:
-            print_json(result)
+        # Use centralized output handler
+        format_response(table_data, ctx, columns=["name", "id", "connector", "status", "created"])
 
     except ClientError as e:
         print_error(str(e))
@@ -61,8 +56,8 @@ def list_connections(
 
 @app.command("get")
 def get_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID"),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """
     Get detailed information about a specific connection.
@@ -71,30 +66,12 @@ def get_connection(
 
     Examples:
         powerautomate connection get shared_prg-5fpodio-123456789
-        powerautomate connection get shared_prg-5fpodio-123456789 --json
     """
     try:
         client = get_client()
         connection = client.get_connection(connection_id)
 
-        if json_output:
-            print_json(connection)
-        else:
-            # Pretty print key information
-            props = connection.get("properties", {})
-            print_info(f"Connection: {props.get('displayName', 'N/A')}")
-            print_info(f"ID: {connection.get('name', 'N/A')}")
-            print_info(f"Connector: {props.get('apiId', 'N/A')}")
-            print_info(f"Status: {props.get('statuses', [{}])[0].get('status', 'Unknown')}")
-            print_info(f"Created: {props.get('createdTime', 'N/A')}")
-
-            # Check for OAuth/token info
-            if "parameterValues" in props:
-                print_info("\nAuthentication Configuration:")
-                print_json({"parameterValues": props["parameterValues"]})
-
-            print_info("\nFull details:")
-            print_json(connection)
+        format_response(connection, ctx)
 
     except ClientError as e:
         print_error(str(e))
@@ -103,6 +80,7 @@ def get_connection(
 
 @app.command("refresh")
 def refresh_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID to refresh"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
@@ -127,7 +105,7 @@ def refresh_connection(
         result = client.refresh_connection(connection_id)
 
         print_success(f"Connection {connection_id} refreshed successfully")
-        print_json(result)
+        format_response(result, ctx)
 
     except ClientError as e:
         print_error(str(e))
@@ -136,6 +114,7 @@ def refresh_connection(
 
 @app.command("test")
 def test_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID to test"),
 ):
     """
@@ -156,7 +135,7 @@ def test_connection(
         else:
             print_error(f"Connection {connection_id} test failed: {status.get('error', 'Unknown error')}")
 
-        print_json(result)
+        format_response(result, ctx)
 
     except ClientError as e:
         print_error(str(e))
@@ -165,6 +144,7 @@ def test_connection(
 
 @app.command("update")
 def update_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID"),
     enable_auto_refresh: Optional[bool] = typer.Option(None, "--auto-refresh/--no-auto-refresh", help="Enable/disable automatic token refresh"),
     json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
@@ -195,7 +175,7 @@ def update_connection(
         print_success(f"Connection {connection_id} updated")
 
         if json_output:
-            print_json(result)
+            format_response(result, ctx)
         else:
             props = result.get("properties", {})
             print_info(f"Status: {props.get('statuses', [{}])[0].get('status', 'Unknown')}")
@@ -205,8 +185,62 @@ def update_connection(
         raise typer.Exit(1)
 
 
+@app.command("create")
+def create_connection(
+    ctx: typer.Context,
+    connector_id: str = typer.Argument(..., help="Connector ID (e.g., shared_prg-5fpodio-5fd251d00ef0afcb57)"),
+    display_name: str = typer.Option(..., "--name", "-n", help="Display name for the connection"),
+    json_output: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """
+    Create a new connection for a connector.
+
+    NOTE: This command may not work with delegated authentication due to API limitations.
+    Connection creation requires admin-level permissions that may not be available with user tokens.
+
+    If this command fails with a 403 error, you must create the connection manually:
+    1. Go to https://make.powerautomate.com
+    2. Navigate to Data > Connections
+    3. Click "New connection" and select your connector
+    4. Complete the OAuth authentication flow
+    5. Use 'powerautomate connection list --table' to get the new connection ID
+
+    Examples:
+        powerautomate connection create shared_prg-5fpodio-5fd251d00ef0afcb57 --name "Podio Connection"
+        powerautomate connection create shared_prg-5fpodio-5fd251d00ef0afcb57 -n "My Podio" --json
+    """
+    try:
+        client = get_client()
+
+        print_info(f"Creating connection '{display_name}' for connector {connector_id}...")
+        result = client.create_connection(connector_id, display_name)
+
+        print_success(f"Connection created successfully!")
+        print_info(f"Connection ID: {result.get('name', 'N/A')}")
+
+        # Check if OAuth authentication is required
+        props = result.get("properties", {})
+        status = props.get("statuses", [{}])[0].get("status", "")
+
+        if status != "Connected":
+            print_info("\nYou must now authenticate this connection:")
+            print_info("1. Go to https://make.powerautomate.com")
+            print_info("2. Navigate to Data > Connections")
+            print_info(f"3. Find connection '{display_name}'")
+            print_info("4. Click 'Fix connection' or the connection name")
+            print_info("5. Complete the OAuth authentication flow")
+
+        if json_output:
+            format_response(result, ctx)
+
+    except ClientError as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+
 @app.command("delete")
 def delete_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID to delete"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
@@ -239,6 +273,7 @@ def delete_connection(
 
 @app.command("recreate")
 def recreate_connection(
+    ctx: typer.Context,
     connection_id: str = typer.Argument(..., help="Connection ID to recreate"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
 ):
@@ -301,7 +336,7 @@ def recreate_connection(
         print_info(f"3. Find connection '{display_name}' and click 'Fix connection'")
         print_info("4. Complete the OAuth authentication flow")
 
-        print_json(new_connection)
+        format_response(new_connection, ctx)
 
     except ClientError as e:
         print_error(str(e))

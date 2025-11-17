@@ -328,11 +328,14 @@ class PowerAutomateClient:
             Created connector details
 
         Raises:
-            ClientError: If the request fails
+            ClientError: If the request fails or OpenAPI validation fails
         """
         connector_name = definition.get("name")
         if not connector_name:
             raise ClientError("Connector definition must include 'name' field")
+
+        # Validate OpenAPI definition before sending to API
+        self._validate_openapi_in_definition(definition, operation="create")
 
         url = f"https://api.powerapps.com/providers/Microsoft.PowerApps/apis/{connector_name}"
         params = {"api-version": "2016-11-01"}
@@ -363,7 +366,7 @@ class PowerAutomateClient:
             Updated connector details
 
         Raises:
-            ClientError: If the request fails
+            ClientError: If the request fails or OpenAPI validation fails
         """
         url = f"https://api.powerapps.com/providers/Microsoft.PowerApps/apis/{connector_id}"
         params = {
@@ -374,6 +377,12 @@ class PowerAutomateClient:
         # Inject OAuth client secret if provided (required for OAuth connector updates)
         if client_secret:
             self._inject_oauth_secret(definition, client_secret)
+
+        # Remove all read-only properties that the API rejects
+        self._remove_readonly_properties(definition)
+
+        # Validate OpenAPI definition before sending to API
+        self._validate_openapi_in_definition(definition, operation="update")
 
         # Add custom header to identify the tool
         headers = {"x-ms-origin": "powerautomate-cli"}
@@ -439,6 +448,221 @@ class PowerAutomateClient:
                 return True
 
         return False
+
+    def _validate_openapi_in_definition(self, definition: Dict[str, Any], operation: str = "operation") -> None:
+        """
+        Validate OpenAPI definition within a connector definition before sending to API.
+
+        This prevents sending invalid OpenAPI specs that will fail server-side validation,
+        catching errors early with detailed feedback.
+
+        Args:
+            definition: Connector definition that may contain OpenAPI spec
+            operation: Operation name for error messages (e.g., "create", "update")
+
+        Raises:
+            ClientError: If OpenAPI validation fails
+        """
+        from openapi_spec_validator import validate_spec
+        from openapi_spec_validator.validation.exceptions import OpenAPIValidationError
+
+        # Check if definition contains OpenAPI spec
+        props = definition.get("properties", {})
+        openapi_def = props.get("openApiDefinition") or props.get("swagger")
+
+        if not openapi_def:
+            # No OpenAPI definition to validate (e.g., OAuth-only update)
+            print(f"[DEBUG] No OpenAPI definition found in {operation} payload - skipping validation")
+            return
+
+        # Log validation attempt
+        path_count = len(openapi_def.get("paths", {})) if isinstance(openapi_def, dict) else 0
+        print(f"[DEBUG] Validating OpenAPI definition for {operation} ({path_count} paths)...")
+
+        # Validate the OpenAPI specification
+        try:
+            validate_spec(openapi_def)
+            print(f"[DEBUG] OpenAPI validation passed for {operation}")
+        except OpenAPIValidationError as e:
+            # Extract the most useful error information
+            error_lines = str(e).split('\n')
+            main_error = error_lines[0] if error_lines else str(e)
+
+            # Build detailed error message
+            error_msg = f"OpenAPI validation failed for connector {operation}:\n"
+            error_msg += f"  {main_error}\n"
+
+            # Try to extract specific validation errors
+            if len(error_lines) > 1:
+                error_msg += "\nDetailed errors:\n"
+                for line in error_lines[1:6]:  # Show first 5 detail lines
+                    if line.strip():
+                        error_msg += f"  {line}\n"
+                if len(error_lines) > 6:
+                    error_msg += f"  ... and {len(error_lines) - 6} more errors\n"
+
+            error_msg += "\nPlease fix the OpenAPI specification before retrying."
+            raise ClientError(error_msg)
+        except Exception as e:
+            # Catch any other validation errors
+            raise ClientError(f"OpenAPI validation error: {type(e).__name__}: {e}")
+
+    def _create_backend_service_url(self, openapi_def: Dict[str, Any]) -> Optional[str]:
+        """
+        Create a backend service URL from the OpenAPI definition.
+
+        This replicates paconn's approach of constructing the backend URL
+        from the OpenAPI specification's scheme, host, and basePath.
+
+        Args:
+            openapi_def: OpenAPI/Swagger definition
+
+        Returns:
+            Backend service URL or None if missing required fields
+        """
+        import urllib.parse
+
+        schemes = openapi_def.get("schemes", [])
+        scheme = next(iter(schemes), '') if schemes else ''
+        netloc = openapi_def.get("host", '')
+        path = openapi_def.get("basePath", '')
+
+        if not scheme or not netloc:
+            return None
+
+        params = ''
+        query = ''
+        fragment = ''
+
+        parts = (scheme, netloc, path, params, query, fragment)
+        url = urllib.parse.urlunparse(parts)
+
+        return url
+
+    def _remove_readonly_properties(self, definition: Dict[str, Any]) -> None:
+        """
+        Remove read-only properties and transform connector definition for updates.
+
+        The PowerApps API is very strict about which properties can be updated.
+        This method:
+        1. Strips all read-only fields
+        2. Transforms 'swagger' to 'openApiDefinition' (paconn format)
+        3. Ensures required fields like 'environment' are properly formatted
+
+        Modifies the definition in-place.
+
+        Args:
+            definition: Connector definition to clean and transform
+        """
+        # Top-level read-only fields
+        readonly_top_level = ["name", "id", "type"]
+        for field in readonly_top_level:
+            if field in definition:
+                del definition[field]
+
+        # Properties-level read-only fields
+        if "properties" in definition:
+            props = definition["properties"]
+
+            # Transform 'swagger' to 'openApiDefinition' (paconn uses this name)
+            # The exported format uses 'swagger' but updates require 'openApiDefinition'
+            if "swagger" in props:
+                swagger = props.pop("swagger")
+
+                # Normalize Azure APIM proxy details in exported swagger
+                # Exported connectors have swagger with Azure APIM proxy details that must be cleaned
+                if isinstance(swagger, dict):
+                    # Remove Azure APIM proxy host - Power Platform will inject it during deployment
+                    if swagger.get("host", "").endswith(".azure-apim.net"):
+                        swagger.pop("host", None)
+
+                    # Remove Azure APIM basePath - these are deployment-specific, not part of the API spec
+                    basePath = swagger.get("basePath", "")
+                    if basePath and basePath.startswith("/apim/"):
+                        swagger.pop("basePath", None)
+
+                    # Remove leading /{connectionId}/ from all paths
+                    # Power Platform automatically prepends /{connectionId}/ to custom connector paths
+                    # Exported swagger includes it, but re-importing would double it: /{connectionId}/{connectionId}/...
+                    if "paths" in swagger and isinstance(swagger["paths"], dict):
+                        normalized_paths = {}
+                        for path, path_item in swagger["paths"].items():
+                            # Strip leading /{connectionId}/ or /{connectionId}
+                            if path.startswith("/{connectionId}/"):
+                                normalized_path = path[len("/{connectionId}"):]
+                            elif path == "/{connectionId}":
+                                normalized_path = "/"
+                            else:
+                                normalized_path = path
+
+                            # Also remove connectionId from the parameters array since it's auto-added
+                            if isinstance(path_item, dict):
+                                for method in ["get", "post", "put", "patch", "delete", "options", "head"]:
+                                    if method in path_item and isinstance(path_item[method], dict):
+                                        params = path_item[method].get("parameters", [])
+                                        if isinstance(params, list):
+                                            # Remove connectionId parameter
+                                            path_item[method]["parameters"] = [
+                                                p for p in params
+                                                if not (isinstance(p, dict) and p.get("name") == "connectionId")
+                                            ]
+
+                            normalized_paths[normalized_path] = path_item
+                        swagger["paths"] = normalized_paths
+
+                props["openApiDefinition"] = swagger
+
+            # NOTE: Do NOT reconstruct backendService from exported swagger!
+            # Exported connectors have swagger with Azure APIM proxy details (host: msmanaged-na.azure-apim.net)
+            # but backendService points to the actual backend (e.g., https://api.podio.com/)
+            # Power Platform manages backendService automatically based on the connector configuration.
+            # Only construct backendService when CREATING new connectors from clean swagger files,
+            # not when updating existing connectors from exported definitions.
+
+            # Ensure environment is properly formatted if it exists
+            # Paconn includes this in updates, formatted as {"name": "env-id"}
+            if "environment" in props:
+                env = props["environment"]
+                if isinstance(env, dict) and "name" in env:
+                    # Already formatted correctly
+                    pass
+                elif isinstance(env, dict) and "id" in env:
+                    # Transform from {id, name, type} to just {name}
+                    props["environment"] = {"name": env.get("id", "")}
+                elif isinstance(env, str):
+                    # Transform from string to {name}
+                    props["environment"] = {"name": env}
+
+            readonly_properties = [
+                "displayName",           # Error: "Cannot update API displayName"
+                "apiEnvironment",        # Error: "Cannot update API environment" (different from 'environment')
+                "backendService",        # Managed by Power Platform based on openApiDefinition
+                "iconUri",               # Read-only metadata (upload via blob storage instead)
+                "iconBrandColor",        # Read-only metadata
+                "xrmConnectorId",        # Read-only identifier
+                "createdTime",           # Read-only timestamp
+                "changedTime",           # Read-only timestamp
+                "lastModifiedTime",      # Read-only timestamp
+                "modifiedBy",            # Read-only metadata
+                "tier",                  # Read-only metadata
+                "publisher",             # Read-only metadata
+                "createdBy",             # Read-only metadata
+                "capabilities",          # Read-only metadata
+                "metadata",              # Often read-only
+                "runtimeUrls",           # Read-only runtime info
+                "primaryRuntimeUrl",     # Read-only runtime info
+                "wadlUrl",               # Read-only definition URL
+                "apiVersion",            # Read-only version
+                "almMode",               # Read-only ALM mode
+                "doNotUseApiHubNetRuntimeUrl",  # Read-only runtime config
+                "rateLimit",             # Read-only rate limit config
+                "parameters",            # Read-only parameters
+                "apiDefinitions",        # Read-only API definitions (different from openApiDefinition)
+            ]
+
+            for field in readonly_properties:
+                if field in props:
+                    del props[field]
 
     def _inject_oauth_secret(self, definition: Dict[str, Any], client_secret: str) -> None:
         """
@@ -783,12 +1007,13 @@ class PowerAutomateClient:
         except requests.exceptions.RequestException as e:
             raise ClientError(f"Request failed: {e}")
 
-    def get_connection(self, connection_id: str) -> Dict[str, Any]:
+    def get_connection(self, connection_id: str, connector_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Get detailed information about a specific connection.
 
         Args:
             connection_id: Connection ID
+            connector_id: Optional connector ID (if not provided, searches all connections)
 
         Returns:
             Connection details including OAuth configuration
@@ -796,7 +1021,17 @@ class PowerAutomateClient:
         Raises:
             ClientError: If the request fails
         """
-        url = f"https://api.powerapps.com/providers/Microsoft.PowerApps/connections/{connection_id}"
+        # If connector_id provided, use the more specific endpoint
+        if connector_id:
+            url = f"https://api.powerapps.com/providers/Microsoft.PowerApps/apis/{connector_id}/connections/{connection_id}"
+        else:
+            # Search all connections to find this one
+            all_connections = self.list_connections()
+            for conn in all_connections.get("value", []):
+                if conn.get("name") == connection_id:
+                    return conn
+            raise ClientError(f"Connection not found: {connection_id}")
+
         params = {"api-version": "2016-11-01", "$filter": f"environment eq '{self.environment_id}'"}
 
         try:
@@ -904,13 +1139,33 @@ class PowerAutomateClient:
         WARNING: This will break any flows using this connection!
 
         Args:
-            connection_id: Connection ID
+            connection_id: Connection ID (simple ID or full resource path)
 
         Raises:
             ClientError: If the request fails
         """
-        url = f"https://api.powerapps.com/providers/Microsoft.PowerApps/connections/{connection_id}"
-        params = {"api-version": "2016-11-01"}
+        # If this is just the connection ID (not full path), we need to look it up
+        # to get the API ID for the correct delete endpoint
+        if not connection_id.startswith("/providers/"):
+            # Get connection details to find the full resource path
+            connection = self.get_connection(connection_id)
+            api_id = connection.get("properties", {}).get("apiId")
+
+            if not api_id:
+                raise ClientError(f"Could not determine API ID for connection: {connection_id}")
+
+            # Construct full resource path: {apiId}/connections/{connectionId}
+            resource_path = f"{api_id}/connections/{connection_id}"
+        else:
+            # Already have full resource path
+            resource_path = connection_id
+
+        # Delete using full resource path
+        url = f"https://api.powerapps.com{resource_path}"
+        params = {
+            "api-version": "2016-11-01",
+            "$filter": f"environment eq '{self.environment_id}'"
+        }
 
         try:
             response = self.session.delete(url, params=params)
@@ -1124,3 +1379,24 @@ def reset_client():
     """Reset the global client instance (useful for testing)."""
     global _client
     _client = None
+
+
+# ============================================================================
+# Dataverse Web API Client
+# ============================================================================
+# Import Dataverse client for querying Dataverse tables (workflows, async operations, etc.)
+from .dataverse_client import (
+    DataverseClient,
+    get_dataverse_client,
+    reset_dataverse_client,
+)
+
+# Re-export for convenience
+__all__ = [
+    'PowerAutomateClient',
+    'get_client',
+    'reset_client',
+    'DataverseClient',
+    'get_dataverse_client',
+    'reset_dataverse_client',
+]

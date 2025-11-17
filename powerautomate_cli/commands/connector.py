@@ -9,8 +9,7 @@ from pathlib import Path
 
 from ..client import get_client
 from ..output import (
-    print_json,
-    print_table,
+    format_response,
     print_success,
     print_error,
     print_info,
@@ -24,7 +23,7 @@ app = typer.Typer(help="Manage Power Automate connectors (custom and managed)")
 
 @app.command("list")
 def list_connectors(
-    table_format: bool = typer.Option(False, "--table", "-t", help="Display as table"),
+   ctx: typer.Context,
     custom: bool = typer.Option(False, "--custom", help="Show only custom connectors"),
     managed: bool = typer.Option(False, "--managed", help="Show only managed connectors"),
     filter_text: Optional[str] = typer.Option(None, "--filter", "-f", help="Filter by name or publisher"),
@@ -37,8 +36,8 @@ def list_connectors(
 
     Examples:
         powerautomate connector list
-        powerautomate connector list --table
-        powerautomate connector list --custom --table
+        powerautomate --table connector list
+        powerautomate --table connector list --custom
         powerautomate connector list --filter "podio"
         powerautomate connector list --managed --filter "sharepoint"
     """
@@ -59,29 +58,28 @@ def list_connectors(
             print_error("No connectors found")
             return
 
-        # Format for display
-        if table_format:
-            display_connectors = []
-            for connector in connectors:
-                props = connector.get("properties", {})
+        # Build display data
+        display_connectors = []
+        for connector in connectors:
+            props = connector.get("properties", {})
 
-                # Determine connector type
-                is_custom = client._is_custom_connector(connector)
-                connector_type = "Custom" if is_custom else "Managed"
+            # Determine connector type
+            is_custom = client._is_custom_connector(connector)
+            connector_type = "Custom" if is_custom else "Managed"
 
-                # Extract tier (if available)
-                tier = props.get("tier", "N/A")
+            # Extract tier (if available)
+            tier = props.get("tier", "N/A")
 
-                display_connectors.append({
-                    "name": props.get("displayName", ""),
-                    "id": connector.get("name", ""),
-                    "type": connector_type,
-                    "publisher": props.get("publisher", ""),
-                    "tier": tier,
-                })
-            print_table(display_connectors, ["name", "id", "type", "publisher", "tier"])
-        else:
-            print_json(connectors)
+            display_connectors.append({
+                "name": props.get("displayName", ""),
+                "id": connector.get("name", ""),
+                "type": connector_type,
+                "publisher": props.get("publisher", ""),
+                "tier": tier,
+            })
+
+        # Use centralized output handler
+        format_response(display_connectors, ctx, columns=["name", "id", "type", "publisher", "tier"])
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -90,6 +88,7 @@ def list_connectors(
 
 @app.command("get")
 def get_connector(
+    ctx: typer.Context,
     connector_id: str = typer.Argument(..., help="Connector ID (name)"),
     operations: bool = typer.Option(False, "--operations", "-o", help="Show operations/actions"),
     permissions: bool = typer.Option(False, "--permissions", "-p", help="Show permissions"),
@@ -114,7 +113,7 @@ def get_connector(
             # Get connector details
             result = client.get_connector(connector_id, include_operations=operations)
 
-        print_json(result)
+        format_response(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -123,6 +122,7 @@ def get_connector(
 
 @app.command("create")
 def create_connector(
+    ctx: typer.Context,
     definition_file: Path = typer.Option(..., "--definition-file", "-f", help="JSON file with connector definition"),
 ):
     """
@@ -162,7 +162,7 @@ def create_connector(
 
         connector_name = result.get("properties", {}).get("displayName", result.get("name"))
         print_success(f"Custom connector created successfully: {connector_name}")
-        print_json(result)
+        format_response(result, ctx)
 
     except Exception as e:
         exit_code = handle_api_error(e)
@@ -171,6 +171,7 @@ def create_connector(
 
 @app.command("update")
 def update_connector(
+    ctx: typer.Context,
     connector_id: str = typer.Argument(..., help="Connector ID (name)"),
     definition_file: Optional[Path] = typer.Option(None, "--definition-file", "-f", help="JSON file with updated connector definition"),
     edit: bool = typer.Option(False, "--edit", "-e", help="Open connector in editor for interactive editing"),
@@ -332,6 +333,10 @@ def _update_connector_from_file(client, connector_id: str, definition_file: Path
     updated_props = result.get("properties", {})
     print_info(f"Updated name: {updated_props.get('displayName', 'N/A')}")
 
+    # Important notice about connections
+    print_warning("\nIMPORTANT: Any connections using this connector must be recreated to inherit these schema changes.")
+    print_info("Existing connections will continue using the old schema until they are deleted and recreated.")
+
 
 def _update_connector_interactive(client, connector_id: str, oauth_secret: Optional[str], backup: bool, no_confirm: bool):
     """Open connector definition in editor for interactive editing."""
@@ -412,6 +417,10 @@ def _update_connector_interactive(client, connector_id: str, oauth_secret: Optio
         updated_props = result.get("properties", {})
         print_info(f"Updated name: {updated_props.get('displayName', 'N/A')}")
 
+        # Important notice about connections
+        print_warning("\nIMPORTANT: Any connections using this connector must be recreated to inherit these schema changes.")
+        print_info("Existing connections will continue using the old schema until they are deleted and recreated.")
+
     except json.JSONDecodeError as e:
         raise ClientError(f"Invalid JSON after editing: {e}")
     except subprocess.CalledProcessError:
@@ -425,6 +434,7 @@ def _update_connector_interactive(client, connector_id: str, oauth_secret: Optio
 
 @app.command("delete")
 def delete_connector(
+    ctx: typer.Context,
     connector_id: str = typer.Argument(..., help="Connector ID (name)"),
     confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ):
@@ -461,6 +471,7 @@ def delete_connector(
 
 @app.command("export")
 def export_connector(
+    ctx: typer.Context,
     connector_id: str = typer.Argument(..., help="Connector ID (name)"),
     output: Path = typer.Option(..., "--output", "-o", help="Output file path"),
     openapi: bool = typer.Option(False, "--openapi", help="Export OpenAPI/Swagger definition only"),
