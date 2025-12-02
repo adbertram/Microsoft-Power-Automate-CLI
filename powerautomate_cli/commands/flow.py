@@ -560,7 +560,7 @@ def list_runs(
         for run in runs:
             # Power Automate API fields
             props = run.get("properties", {})
-            run_name = run.get("name", "")[:8] + "..."  # Truncate ID
+            run_name = run.get("name", "")
             status = props.get("status", "")
             start_time = props.get("startTime", "")
             end_time = props.get("endTime", "")
